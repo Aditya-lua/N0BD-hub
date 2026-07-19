@@ -870,6 +870,7 @@ end
 -- authoritative tool helpers (game client requires the matching tool equipped)
 local function findToolByAttr(attrName, expectedName)
     local want = type(expectedName) == "string" and expectedName:lower() or nil
+    local fuzzyHit, fuzzyAttr = nil, nil
     local function scan(container)
         if not container then
             return nil
@@ -877,8 +878,17 @@ local function findToolByAttr(attrName, expectedName)
         for _, t in ipairs(container:GetChildren()) do
             if t:IsA("Tool") then
                 local attr = t:GetAttribute(attrName)
-                if type(attr) == "string" and (not want or attr:lower() == want or t.Name:lower() == want) then
-                    return t, attr
+                if type(attr) == "string" then
+                    local attrLower = attr:lower()
+                    local nameLower = t.Name:lower()
+                    if not want or attrLower == want or nameLower == want then
+                        return t, attr
+                    end
+                    if want and not fuzzyHit
+                        and (attrLower:find(want, 1, true) or nameLower:find(want, 1, true) or want:find(attrLower, 1, true))
+                    then
+                        fuzzyHit, fuzzyAttr = t, attr
+                    end
                 end
             end
         end
@@ -894,7 +904,7 @@ local function findToolByAttr(attrName, expectedName)
     if t then
         return t, a
     end
-    return nil
+    return fuzzyHit, fuzzyAttr
 end
 
 local function equipTool(tool)
@@ -910,7 +920,10 @@ local function equipTool(tool)
         humanoid:EquipTool(tool)
     end)
     task.wait(0.1)
-    return tool
+    if tool.Parent ~= char then
+        task.wait(0.15)
+    end
+    return (tool.Parent == char) and tool or nil
 end
 
 -- position mode resolver
@@ -1254,6 +1267,7 @@ local function getStealTargets()
                     plantId = m:GetAttribute("PlantId"),
                     fruitId = m:GetAttribute("FruitId") or "",
                     userId = ownerUserId,
+                    hold = tonumber(p.HoldDuration) or 0,
                     crop = cropName,
                     mutation = m:GetAttribute("Mutation"),
                     weight = tonumber(m:GetAttribute("SizeMulti")) or 1,
@@ -1288,6 +1302,50 @@ local function getSoilAreas(plot)
         end
     end
     return areas
+end
+
+-- snap a world XZ to the nearest PlantArea soil surface (mirrors the game client's TryPlant/TryWater raycast hit)
+local function soilPositionAt(plot, x, z)
+    if not plot then
+        return nil
+    end
+    local best, bestDist = nil, math.huge
+    for _, area in ipairs(getSoilAreas(plot)) do
+        local ok, surface, dist = pcall(function()
+            local localPos = area.CFrame:PointToObjectSpace(Vector3.new(x, area.Position.Y, z))
+            local clampX = math.clamp(localPos.X, -area.Size.X / 2 + 0.5, area.Size.X / 2 - 0.5)
+            local clampZ = math.clamp(localPos.Z, -area.Size.Z / 2 + 0.5, area.Size.Z / 2 - 0.5)
+            local s = (area.CFrame * CFrame.new(clampX, area.Size.Y / 2 + 0.05, clampZ)).Position
+            return s, (Vector2.new(s.X - x, s.Z - z)).Magnitude
+        end)
+        if ok and surface then
+            if dist < 0.05 then
+                return surface
+            end
+            if dist < bestDist then
+                bestDist = dist
+                best = surface
+            end
+        end
+    end
+    return best
+end
+
+-- dump backpack/character tools carrying attrName to console (diagnostics for tool-matching issues)
+local function dumpTools(attrName)
+    local seen = {}
+    local function scanTools(container)
+        if container then
+            for _, t in ipairs(container:GetChildren()) do
+                if t:IsA("Tool") then
+                    seen[#seen + 1] = tostring(t.Name) .. " [" .. tostring(attrName) .. "=" .. tostring(t:GetAttribute(attrName)) .. "]"
+                end
+            end
+        end
+    end
+    scanTools(client.Character)
+    scanTools(client:FindFirstChild("Backpack"))
+    print("[GAG2] tools(" .. tostring(attrName) .. "): " .. (#seen > 0 and table.concat(seen, ", ") or "NONE"))
 end
 
 local function getPlantSlots(plot, pattern)
@@ -2109,22 +2167,28 @@ local function doPlant()
     local delay = tonumber(Library.Flags["plantDelay"]) or 0.1
     local planted = 0
     local equippedSeed, equippedTool = nil, nil
+    local missingWarned = false
     for i = 1, cap do
         local seedName = toPlant[i]
         if equippedSeed ~= seedName then
             local tool = findToolByAttr("SeedTool", seedName)
             equippedTool = tool and equipTool(tool) or nil
-            equippedSeed = seedName
+            equippedSeed = equippedTool and seedName or nil
+            if not equippedTool then
+                if not missingWarned then
+                    missingWarned = true
+                    dumpTools("SeedTool")
+                    notify("Auto Plant", "Seed tool not found / equip failed: " .. tostring(seedName) .. " (see console)", "warn")
+                end
+                task.wait(jitter(delay, delay * 0.15))
+            end
         end
         if equippedTool then
             -- authoritative: Fire(position, seedName-from-tool-attr, equippedTool)
             netFire("Plant.PlantSeed", free[i], equippedTool:GetAttribute("SeedTool") or seedName, equippedTool)
-        else
-            -- fallback if the seed tool is missing (works only when server skips tool validation)
-            netFire("Plant.PlantSeed", free[i], seedName, plot)
+            planted = planted + 1
+            task.wait(jitter(delay, delay * 0.15))
         end
-        planted = planted + 1
-        task.wait(jitter(delay, delay * 0.15))
     end
     return planted
 end
@@ -2145,7 +2209,8 @@ local function isOwnerHome(userId, targetPos)
 end
 
 local function doSteal()
-    if Library.Flags["lockNight"] and not isNight() then
+    -- steal is night-only: the game client itself checks ReplicatedStorage.Night == true before BeginSteal
+    if not isNight() then
         return
     end
     local targets = getStealTargets()
@@ -2180,29 +2245,33 @@ local function doSteal()
             if not lastPosition or (pos - lastPosition).Magnitude > 12 then
                 teleport(pos)
                 lastPosition = pos
+                task.wait(0.22) -- settle: let the new position replicate to the server before firing
             end
-            -- verified: BeginSteal(userId, plantId, fruitId) - correct arg order
             netFire("Steal.BeginSteal", t.userId, t.plantId, t.fruitId)
-            local delayTime = tonumber(Library.Flags["stealDelay"]) or 0.3
-            local elapsed = 0
-            while elapsed < delayTime and Hub.running do
-                task.wait(0.08)
-                elapsed = elapsed + 0.08
-                if Library.Flags["stealEvasion"] then
-                    for _, pl in ipairs(Players:GetPlayers()) do
-                        if pl ~= client and pl.Character and (t.userId == pl.UserId or pl.Character:FindFirstChild("Shovel") or pl.Character:FindFirstChild("Crowbar")) then
-                            local phrp = pl.Character:FindFirstChild("HumanoidRootPart")
-                            local myhrp = getHRP()
-                            if phrp and myhrp and (phrp.Position - myhrp.Position).Magnitude < 18 then
-                                teleport(myhrp.Position + Vector3.new(0, 35, 0))
-                                break
+            -- game client fires CompleteSteal immediately for HoldDuration==0 prompts;
+            -- only hold-type prompts need the hold window (with evasion) before completing
+            local holdTime = tonumber(t.hold) or 0
+            if holdTime > 0 then
+                local elapsed = 0
+                while elapsed < holdTime + 0.1 and Hub.running do
+                    task.wait(0.08)
+                    elapsed = elapsed + 0.08
+                    if Library.Flags["stealEvasion"] then
+                        for _, pl in ipairs(Players:GetPlayers()) do
+                            if pl ~= client and pl.Character and (t.userId == pl.UserId or pl.Character:FindFirstChild("Shovel") or pl.Character:FindFirstChild("Crowbar")) then
+                                local phrp = pl.Character:FindFirstChild("HumanoidRootPart")
+                                local myhrp = getHRP()
+                                if phrp and myhrp and (phrp.Position - myhrp.Position).Magnitude < 18 then
+                                    teleport(myhrp.Position + Vector3.new(0, 35, 0))
+                                    break
+                                end
                             end
                         end
                     end
                 end
             end
-            -- verified: CompleteSteal() - 0 args
             netFire("Steal.CompleteSteal")
+            task.wait(jitter(tonumber(Library.Flags["stealDelay"]) or 0.25, 0.05))
             if Library.Flags["autoStealBest"] or mode == "Best" then
                 break
             end
@@ -2346,18 +2415,53 @@ local function doSprinkler()
     if not name then
         return
     end
-    local pos = resolveModePosition(firstValue(Library.Flags["sprinklerPos"] or {}), "savedSprinklerPos", plot)
-    if not pos then
-        local areas = getSoilAreas(plot)
-        if #areas > 0 then
-            pos = areas[1].Position + Vector3.new(0, 2, 0)
+    local existingPts = {}
+    if existing then
+        for _, sp in ipairs(existing:GetChildren()) do
+            local ok3, spos = pcall(function()
+                return sp:GetPivot().Position
+            end)
+            if ok3 and spos then
+                existingPts[#existingPts + 1] = spos
+            end
+        end
+    end
+    local plants = plot:FindFirstChild("Plants")
+    local pos = nil
+    for _ = 1, 8 do
+        local cand = resolveModePosition(firstValue(Library.Flags["sprinklerPos"] or {}), "savedSprinklerPos", plot)
+        if not cand and plants then
+            local kids = plants:GetChildren()
+            if #kids > 0 then
+                -- prefer placing near a random plant (coverage) then snap to soil
+                local ok3, ppos = pcall(function()
+                    return kids[math.random(#kids)]:GetPivot().Position
+                end)
+                if ok3 then
+                    cand = ppos
+                end
+            end
+        end
+        if not cand then
+            break
+        end
+        cand = cand + Vector3.new((math.random() - 0.5) * 6, 0, (math.random() - 0.5) * 6)
+        cand = soilPositionAt(plot, cand.X, cand.Z) or cand
+        local tooClose = false
+        for _, spos in ipairs(existingPts) do
+            if (Vector2.new(spos.X - cand.X, spos.Z - cand.Z)).Magnitude < 8 then
+                tooClose = true
+                break
+            end
+        end
+        if not tooClose then
+            pos = cand
+            break
         end
     end
     if not pos then
         return
     end
-    -- small per-attempt offset so repeat cycles do not stack on one spot (IsTooCloseToSprinkler)
-    pos = pos + Vector3.new((math.random() - 0.5) * 6, 0, (math.random() - 0.5) * 6)
     -- authoritative 4th arg: numeric plot id from plot name (game GetPlotId = name digits)
     local plotId = tonumber(tostring(plot.Name):match("%d+")) or 1
     local tool, toolName = findToolByAttr("Sprinkler", name)
@@ -2420,25 +2524,29 @@ local function doWateringCan()
     local targetCrop = firstValue(Library.Flags["waterPlants"] or {})
     local waterAll = Library.Flags["autoWaterAll"]
     local canTool = nil
+    local canWarned = false
     for _, pl in ipairs(plants:GetChildren()) do
         local decaying = pl:GetAttribute("IsDecaying") or pl:GetAttribute("Decaying")
         if decaying then
             local crop = pl:GetAttribute("SeedName") or pl:GetAttribute("CorePartName")
             if waterAll or not targetCrop or (crop and crop:lower() == targetCrop:lower()) then
-                local ok, pos = pcall(function()
+                local ok, basePos = pcall(function()
                     return pl:GetPivot().Position
                 end)
-                if ok then
+                if ok and basePos then
                     if not canTool then
                         local t = findToolByAttr("WateringCan", canName)
                         canTool = t and equipTool(t) or nil
+                        if not canTool and not canWarned then
+                            canWarned = true
+                            dumpTools("WateringCan")
+                            notify("Auto Water", "Watering can tool not found / equip failed (see console)", "warn")
+                        end
                     end
                     if canTool then
-                        -- authoritative: Fire(ground-pos, name-from-tool-attr, equippedTool)
-                        netFire("WateringCan.UseWateringCan", pos - Vector3.new(0, 0.3, 0), canTool:GetAttribute("WateringCan") or canName or "", canTool)
-                    else
-                        -- fallback if the watering can is missing
-                        netFire("WateringCan.UseWateringCan", pos, canName or "", pl)
+                        -- game client raycasts onto a PlantArea-tagged soil part and fires the hit surface pos
+                        local surface = soilPositionAt(plot, basePos.X, basePos.Z) or basePos
+                        netFire("WateringCan.UseWateringCan", surface - Vector3.new(0, 0.3, 0), canTool:GetAttribute("WateringCan") or canName or "", canTool)
                     end
                     task.wait(0.2)
                 end
