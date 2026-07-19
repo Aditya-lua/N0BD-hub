@@ -5,7 +5,6 @@
 -- ===============================================================
 
 -- services
-local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -339,6 +338,7 @@ end
 
 local Setup = Library:Setup({ Location = CoreGui, OpenCloseLocation = "Bottom Right" })
 
+do -- scoped: CreateSection proxy internals (Delta 200-register limit)
 -- CreateSection proxy: captures create* returns + FindFirstChild adapter (updateText->Set)
 local _ctrls = {}
 local _origCreateSection = Setup.CreateSection
@@ -411,6 +411,7 @@ function Setup:CreateSection(name)
     end
     return proxy
 end
+end -- scoped: CreateSection proxy
 
 -- anti-afk
 track(client.Idled:Connect(function()
@@ -539,73 +540,35 @@ local function createIntervalToggle(section, cfg)
 end
 
 -- utility helpers
-local function prettyPrint(data, indent)
-    indent = indent or 0
-    local prefix = string.rep("    ", indent)
-    if type(data) ~= "table" then
-        print(prefix .. tostring(data))
-        return
-    end
-    for k, v in pairs(data) do
-        if type(v) == "table" then
-            print(prefix .. tostring(k) .. ":")
-            prettyPrint(v, indent + 1)
-        else
-            print(prefix .. tostring(k) .. ": " .. tostring(v))
-        end
-    end
-end
-local function addUnique(list, value)
-    if value == nil then
-        return
-    end
-    for _, existing in ipairs(list) do
-        if existing == value then
-            return
-        end
-    end
-    table.insert(list, value)
-end
-local function createTodoToggle(section, name, flagName)
-    section:createToggle({
-        Name = tostring(name) .. " (TODO)",
-        Flag = false,
-        flagName = flagName,
-        Callback = function(enabled)
-            Library:CleanupConnectionsByTag(flagName)
-            if not enabled then
-                return
-            end
-            interval(flagName, flagName, 5, function() end)
-        end,
-    })
-end
 
 -- game API bootstrap
 local Network, PlayerState, SeedData, SeedPrice, PetCache, FruitValueCalc, SeedBaseValue, SeedRarity
-local ok, m = pcall(function()
+local function tryRequire(loader)
+    local success, result = pcall(loader)
+    return success and result or nil
+end
+local mod = tryRequire(function()
     local sm = ReplicatedStorage:FindFirstChild("SharedModules") or ReplicatedStorage:WaitForChild("SharedModules", 10)
     return require(sm and (sm:FindFirstChild("Networking") or sm:WaitForChild("Networking", 10)) or ReplicatedStorage.SharedModules.Networking)
 end)
-if ok and m then
-    Network = m
-else
+if not mod then
     warn("[GAG2] Networking module unavailable - aborting")
     return
 end
-local ok2, m2 = pcall(function()
+Network = mod
+mod = tryRequire(function()
     local cm = ReplicatedStorage:FindFirstChild("ClientModules") or ReplicatedStorage:WaitForChild("ClientModules", 10)
     return require(cm and (cm:FindFirstChild("PlayerStateClient") or cm:WaitForChild("PlayerStateClient", 10)) or ReplicatedStorage.ClientModules.PlayerStateClient)
 end)
-if ok2 and m2 then
-    PlayerState = m2
+if mod then
+    PlayerState = mod
 end
-local ok3, d = pcall(function()
+mod = tryRequire(function()
     local sm = ReplicatedStorage:FindFirstChild("SharedModules") or ReplicatedStorage:WaitForChild("SharedModules", 10)
     return require(sm and (sm:FindFirstChild("SeedData") or sm:WaitForChild("SeedData", 10)) or ReplicatedStorage.SharedModules.SeedData)
 end)
-if ok3 and type(d) == "table" then
-    SeedData = d
+if type(mod) == "table" then
+    SeedData = mod
     SeedPrice = {}
     for _, seedEntry in ipairs(SeedData) do
         if type(seedEntry) == "table" and seedEntry.SeedName then
@@ -619,19 +582,19 @@ for _, seedEntry in ipairs(SeedData or {}) do
         SeedRarity[seedEntry.SeedName] = seedEntry.Rarity or "Common"
     end
 end
-local ok4, m4 = pcall(function()
+mod = tryRequire(function()
     local sd = ReplicatedStorage:FindFirstChild("SharedData") or ReplicatedStorage:WaitForChild("SharedData", 10)
     return require(sd and (sd:FindFirstChild("PetData") or sd:FindFirstChild("Pets") or sd:FindFirstChild("PetCache") or sd:WaitForChild("PetData", 5)) or ReplicatedStorage.SharedData.PetData)
 end)
-if ok4 and m4 then
-    PetCache = m4
+if mod then
+    PetCache = mod
 end
-local ok5, fn = pcall(function()
+mod = tryRequire(function()
     local sm = ReplicatedStorage:FindFirstChild("SharedModules") or ReplicatedStorage:WaitForChild("SharedModules", 10)
     return require(sm and (sm:FindFirstChild("FruitValueCalc") or sm:WaitForChild("FruitValueCalc", 10)) or ReplicatedStorage.SharedModules.FruitValueCalc)
 end)
-if ok5 and type(fn) == "function" then
-    FruitValueCalc = fn
+if type(mod) == "function" then
+    FruitValueCalc = mod
 end
 SeedBaseValue = {}
 if FruitValueCalc and SeedData then
@@ -801,13 +764,6 @@ local function netCall(path, ...)
     return nil
 end
 
--- safeNetFire: wraps netFire in pcall to prevent remote errors from bubbling up
-local function safeNetFire(path, ...)
-    local ok, err = pcall(netFire, path, ...)
-    if not ok then
-        warn("[GAG] safeNetFire failed:", path, err)
-    end
-end
 
 -- core data helpers
 local function sizeMul(size)
@@ -997,11 +953,6 @@ end
 local function crateStock()
     return stockItems("CrateShop")
 end
-local function stockCount(shop, name)
-    local stockParent = stockItems(shop)
-    local foundItem = stockParent and stockParent:FindFirstChild(name)
-    return (foundItem and foundItem:IsA("ValueBase")) and foundItem.Value or 0
-end
 local function nextRestock(shop)
     local stockValues = ReplicatedStorage:FindFirstChild("StockValues")
     stockValues = stockValues and stockValues:FindFirstChild(shop)
@@ -1010,21 +961,18 @@ local function nextRestock(shop)
 end
 
 -- formatting
-local function fmtNum(n)
+local function fmtCash(n)
     n = tonumber(n) or 0
     if n >= 1e9 then
-        return string.format("%.2fB", n / 1e9)
+        return string.format("$%.2fB", n / 1e9)
     end
     if n >= 1e6 then
-        return string.format("%.2fM", n / 1e6)
+        return string.format("$%.2fM", n / 1e6)
     end
     if n >= 1e3 then
-        return string.format("%.1fK", n / 1e3)
+        return string.format("$%.1fK", n / 1e3)
     end
-    return tostring(math.floor(n))
-end
-local function fmtCash(n)
-    return "$" .. fmtNum(n)
+    return "$" .. tostring(math.floor(n))
 end
 
 local function fmtCountdown(unixTs)
@@ -1092,31 +1040,6 @@ local function getCrateList()
     table.sort(list)
     return list
 end
-local function getMySeeds()
-    local playerData = getData()
-    local order = {}
-    for _, seedEntry in ipairs(SeedData or {}) do
-        if seedEntry.SeedName then
-            order[seedEntry.SeedName] = tonumber(seedEntry.SeedShopDisplayOrder) or 900
-        end
-    end
-    local list = {}
-    if playerData and playerData.Inventory and playerData.Inventory.Seeds then
-        for n, c in pairs(playerData.Inventory.Seeds) do
-            if (c or 0) > 0 then
-                list[#list + 1] = n
-            end
-        end
-    end
-    table.sort(list, function(a, b)
-        local oa, ob = order[a] or 900, order[b] or 900
-        if oa == ob then
-            return a < b
-        end
-        return oa < ob
-    end)
-    return list
-end
 local function getCropList()
     local seen = {}
     local plot = myPlot()
@@ -1171,9 +1094,6 @@ local function getWildList()
     end
     table.sort(list)
     return list
-end
-local function maxPetSlots()
-    return tonumber(client:GetAttribute("MaxEquippedPets")) or 3
 end
 local function getBestSeed()
     local playerData = getData()
@@ -1822,13 +1742,15 @@ end
 -- SHOP PREDICTION OVERLAY (local - reads game's own restock data, no API)
 -- ================================================================
 
+local injectAllShopPredictions
+do -- scoped: shop-prediction helpers (Delta 200-register limit)
 local SHOP_NAMES = { "SeedShop", "GearShop", "CrateShop" }
 
 -- read the next restock unix timestamp for a shop directly from StockValues
 local function getNextRestockUnix(shopName)
     local sv = ReplicatedStorage:FindFirstChild("StockValues")
     sv = sv and sv:FindFirstChild(shopName)
-    local restockTimestamp = stockParent and stockParent:FindFirstChild("UnixNextRestock")
+    local restockTimestamp = sv and sv:FindFirstChild("UnixNextRestock")
     return restockTimestamp and restockTimestamp.Value or nil
 end
 
@@ -1989,7 +1911,7 @@ local function injectShopPredictions(shopName)
 end
 
 -- scan all three shops
-local function injectAllShopPredictions()
+injectAllShopPredictions = function()
     pcall(function()
         Gag2API:FetchLive()
     end)
@@ -2000,6 +1922,7 @@ local function injectAllShopPredictions()
         pcall(injectShopPredictions, shopName)
     end
 end
+end -- scoped: shop-prediction helpers
 
 -- ================================================================
 -- FEATURE FUNCTIONS
@@ -3007,6 +2930,7 @@ local function doPetProtection()
 end
 
 -- remove all plants (shovel every plant on your plot)
+local BUILD_FOLDERS = { "Props", "Sprinklers", "Gnomes", "PottedPlants", "Pots", "Objects", "Decor" }
 local function removeAllPlants()
     local plot = myPlot()
     if not plot then
@@ -3300,7 +3224,6 @@ function gardenNearPlayer()
     end
     return closestPlot
 end
-local BUILD_FOLDERS = { "Props", "Sprinklers", "Gnomes", "PottedPlants", "Pots", "Objects", "Decor" }
 
 -- settings persistence
 local SAVE_FILE = "GAG2_Settings.json"
